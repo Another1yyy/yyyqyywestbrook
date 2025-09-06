@@ -23,7 +23,6 @@ def dist_point_to_segment(P, A, B):
     s_clamped = max(0.0, min(1.0, s))
     Q = A + s_clamped * BA
     return float(np.linalg.norm(P - Q)), s_clamped
-
 def bisect_root(f, a, b, tol=1e-10, maxiter=200):
     """在 [a,b] 上用二分法求 f(t)=0（要求 f(a)*f(b) <= 0）"""
     fa, fb = f(a), f(b)
@@ -81,7 +80,7 @@ def find_cover_intervals(f, t0, t1, dt=0.02):
 
     # 处理可能在 t0 或 t1 就处于覆盖内的情形
     cur_in = inside(t0)
-    cursor = t0
+    cursor = t
     for r in roots:
         if cur_in:
             # 从内到外
