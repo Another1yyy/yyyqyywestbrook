@@ -111,50 +111,60 @@ effective_span = 20.0  # 起爆后有效 20 s
 
 # 真目标与导弹初始
 T = np.array([0.0, 200.0, 0.0])          # 真目标
-M0 = np.array([20000.0, 0.0, 2000.0])    # 导弹 M1 初始位置，指向原点
-
-# FY1 无人机：初始、航向、速度、投放与起爆设置
-F0 = np.array([17800.0, 0.0, 1800.0])    # FY1 初始
-theta_rad = math.radians(-169)
-h = np.array([math.cos(theta_rad), math.sin(theta_rad), 0.0])          # 航向：沿 -x 指向假目标方向（题意）
-v_u = 125.0                               # FY1 速度
-t_drop = 46.27                               # 受令后投放时刻 (s)
-tau = 11                                  # 引信延时 (s)
+MISSILES_INFO = {
+    'M1': {'M0': np.array([20000., 0., 2000.])},
+    'M2': {'M0': np.array([19000., 600., 2100.])},
+    'M3': {'M0': np.array([18000., -600., 1900.])}
+}
+DRONES_INFO = {
+    'FY1': {'F0': np.array([17800., 0., 1800.])},
+    'FY2': {'F0': np.array([12000., 1400., 1400.])},
+    'FY3': {'F0': np.array([6000., -3000., 700.])},
+    'FY4': {'F0': np.array([11000., 2000., 1800.])},
+    'FY5': {'F0': np.array([13000., -2000., 1300.])}
+}  # FY1 初始
+h = np.array([-1.0, 0.0, 0.0])           # 航向：沿 -x 指向假目标方向（题意）
+v_u = 120.0                               # FY1 速度
+t_drop = 1.5                               # 受令后投放时刻 (s)
+tau = 3.6                                  # 引信延时 (s)
 t_e = t_drop + tau                         # 起爆时刻
 
 # =========================
 # 轨迹与距离函数
 # =========================
-u_m = unit(-M0)  # 导弹单位方向（指向假目标原点）
 
-def missile_pos(t):
+
+def missile_pos(t,M0):
     """导弹位置 M(t)"""
+    u_m = unit(-M0)
     return M0 + v_m * t * u_m
 
-def drone_pos(t):
+def drone_pos(t,F0):
     """无人机水平等高直线飞行位置 F(t)"""
     return F0 + v_u * t * h
 
 # 投放点 R 与起爆点 E
-R = drone_pos(t_drop)
-E = R + v_u * tau * h + 0.5 * np.array([0.0, 0.0, -g]) * (tau ** 2)
+# R = drone_pos(t_drop,F0)
+# E = R + v_u * tau * h + 0.5 * np.array([0.0, 0.0, -g]) * (tau ** 2)
 
-def cloud_center(t):
+def cloud_center(t,tau,F0,h):
     """
     起爆后云团中心：以 3 m/s 竖直下沉
     仅在 t >= t_e 有意义；调用者会限制时间窗口
     """
+    R = drone_pos(t_drop, F0)
+    E = R + v_u * tau * h + 0.5 * np.array([0.0, 0.0, -g]) * (tau ** 2)
     return E + np.array([0.0, 0.0, -sink_v]) * (t - t_e)
 
-def D_minus_R(t):
+def D_minus_R(t,M,E):
     """
     f(t) = 点到线段距离 - 云团半径
     线段为 [M(t), T]，点为 C(t)
     返回 f(t), D(t), s*(投影参数，便于诊断)
     """
-    A = missile_pos(t)
+    A = missile_pos(t,M)
     B = T
-    P = cloud_center(t)
+    P = cloud_center(t,E)
     D, s = dist_point_to_segment(P, A, B)
     return D - R_cloud, D, s
 

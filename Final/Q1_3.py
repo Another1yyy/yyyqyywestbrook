@@ -149,8 +149,10 @@ def missile_pos(t):
 
 # FY1 无人机（朝 -x）
 F0 = np.array([17800.0, 0.0, 1800.0])
-v_u = 120.0
-h = np.array([-1.0, 0.0, 0.0])
+v_u = 120
+theta = 180
+rad = math.radians(theta)
+h = np.array([math.cos(rad), math.sin(rad), 0.0])
 def drone_pos(t):
     return F0 + v_u * t * h
 

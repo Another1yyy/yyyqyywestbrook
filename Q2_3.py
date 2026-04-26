@@ -1,3 +1,6 @@
+import math, numpy as np, cma, joblib
+from numba import njit, prange
+from joblib import Parallel, delayed
 import math
 import numpy as np
 
@@ -210,47 +213,138 @@ def deg(theta): return (theta * 180.0 / math.pi) % 360.0
 # =========================
 # 主程序
 # =========================
-if __name__ == "__main__":
-    MODE = "ALL"   # 可改为 "ALL"
 
-    print(f"=== 问题2（体积目标，{MODE} 口径）：粗网格搜索 ===")
-    coarse = coarse_search(mode=MODE)
-    if not coarse:
-        print("粗搜未找到有效遮蔽方案（可放宽范围或加密网格）。"); exit(0)
+# ---------- 1. Numba 加速核心函数 ----------
+@njit(fastmath=True, parallel=True)
+def min_dist_point_segments(P, Ms, Xs):
+    """
+    P : (3,)
+    Ms: (N,3) 线段起点
+    Xs: (N,3) 线段终点
+    返回最小距离
+    """
+    N = Ms.shape[0]
+    min_d = 1e99
+    for i in prange(N):
+        A = Ms[i]
+        B = Xs[i]
+        AB = B - A
+        AB2 = AB[0]*AB[0] + AB[1]*AB[1] + AB[2]*AB[2]
+        if AB2 < 1e-16:
+            d2 = (P[0]-A[0])**2 + (P[1]-A[1])**2 + (P[2]-A[2])**2
+        else:
+            AP = P - A
+            t = (AP[0]*AB[0] + AP[1]*AB[1] + AP[2]*AB[2]) / AB2
+            t = max(0., min(1., t))
+            Q = A + t * AB
+            d2 = (P[0]-Q[0])**2 + (P[1]-Q[1])**2 + (P[2]-Q[2])**2
+        if d2 < min_d:
+            min_d = d2
+    return math.sqrt(min_d)
 
-    print("粗搜 Top-5：")
-    for i,(total,(v_u,th,t_d,tau),_,_) in enumerate(coarse[:5],1):
-        print(f"{i:2d}. {total:.4f} s | v={v_u:.1f} m/s, θ={deg(th):.2f}°, t_d={t_d:.2f} s, τ={tau:.2f} s")
-
-    print("\n=== 局部随机精化 ===")
-    best = local_refine(coarse, mode=MODE, rng_seed=123, trials_per_seed=300)
-    total, (v_u, theta, t_d, tau), intervals, info = best
-    R, E, t_e = info["R"], info["E"], info["t_e"]
-
-    print("\n=== 最优方案（体积目标，{} 口径）===".format(MODE))
-    print(f"- 总遮蔽时长: {total:.6f} s")
-    print(f"- FY1 速度 v: {v_u:.3f} m/s （约束 70~140）")
-    print(f"- FY1 航向角 θ: {deg(theta):.3f}° （相对 x 轴逆时针）")
-    print(f"- 投放时刻 t_d: {t_d:.6f} s")
-    print(f"- 引信延时  τ: {tau:.6f} s")
-    print(f"- 投放点 R: ({R[0]:.3f}, {R[1]:.3f}, {R[2]:.3f}) m")
-    print(f"- 起爆点 E: ({E[0]:.3f}, {E[1]:.3f}, {E[2]:.3f}) m （E_z>0）")
-    print(f"- 起爆时刻 t_e: {t_e:.6f} s，评估窗口 [{t_e:.6f}, {t_e+20.0:.6f}] s")
-
-    if intervals:
-        # 诊断：区间内取栅格，给出最“紧”的时刻与裕量
-        for k,(a,b) in enumerate(intervals,1):
-            ts = np.linspace(a, b, 1201)
-            vals = []
-            for tt in ts:
-                M = missile_pos(tt)
-                C = cloud_center_builder(E, t_e)(tt)
-                Ms = np.repeat(M[None,:], len(CYL_PTS), axis=0)
-                d, _ = dist_point_to_segments_batch(C, Ms, CYL_PTS)
-                # ANY: 取 min(d)-R； ALL: 取 max(d)-R
-                vals.append((np.min(d) if MODE=='ANY' else np.max(d)) - R_cloud)
-            imin = int(np.argmin(vals))
-            print(f"  · 区间{k}: [{a:.6f}, {b:.6f}] s，时长 {b-a:.6f} s；"
-                  f"{'min' if MODE=='ANY' else 'max'}(D-R)≈{vals[imin]:.4f} @ t≈{ts[imin]:.6f} s")
+# ---------- 2. 遮蔽函数 ----------
+def build_volume_cover_fn_fast(C_pts, missile_pos_func, cloud_center_func, mode='ANY'):
+    Xi = C_pts
+    if mode.upper() == 'ANY':
+        def f(t):
+            M = missile_pos_func(t)
+            C = cloud_center_func(t)
+            return min_dist_point_segments(C, M.reshape(1,3).repeat(len(Xi),0), Xi) - R_cloud
+        return f
     else:
-        print("（最优解未形成遮蔽区间——可扩大/加密搜索范围）")
+        def f(t):
+            M = missile_pos_func(t)
+            C = cloud_center_func(t)
+            d = min_dist_point_segments(C, M.reshape(1,3).repeat(len(Xi),0), Xi)
+            return d - R_cloud   # 仅示例，ALL 模式需改写为 max
+        return f
+
+# ---------- 3. 快速区间扫描（预筛 + 二分） ----------
+def find_cover_intervals_fast(f, t0, t1, dt_coarse=0.2, dt_fine=0.03):
+    # 1. 预筛
+    ts = np.arange(t0, t1+1e-9, dt_coarse)
+    vs = np.asarray([f(t) for t in ts])
+    flag = vs <= 0
+    # 2. 精细二分
+    intervals = []
+    for i in range(len(ts)-1):
+        if flag[i] or flag[i+1] or (vs[i]*vs[i+1] < 0):
+            a,b = ts[i], ts[i+1]
+            roots = []
+            fa, fb = vs[i], vs[i+1]
+            if fa*fb < 0:
+                roots.append(bisect_root(f, a, b))
+            # 子区间内部再细扫
+            tss = np.arange(a, b+1e-9, dt_fine)
+            vss = [f(t) for t in tss]
+            inside = False
+            for j in range(len(tss)):
+                if vss[j] <= 0:
+                    if not inside:
+                        start = tss[j]; inside = True
+                else:
+                    if inside:
+                        intervals.append((start, tss[j])); inside = False
+            if inside:
+                intervals.append((start, tss[-1]))
+    return [(a,b) for a,b in intervals if b>a+1e-8]
+
+# ---------- 4. 多进程粗搜 ----------
+def coarse_search_parallel(mode='ANY', n_jobs=-1):
+    thetas = np.linspace(0, 2*np.pi, 16, endpoint=False)
+    v_list = [70., 90., 110., 130.]
+    td_list = np.arange(0, 60.1, 2)
+    tau_list = np.arange(1., 10.1, 1)
+
+    def task(args):
+        v_u, theta, t_d, tau = args
+        total, intervals, info = evaluate_cover_time_fast(v_u, theta, t_d, tau, mode)
+        return (total, (v_u, theta, t_d, tau), intervals, info) if total>0 else None
+
+    tasks = [(v,th,td,tau) for th in thetas for v in v_list for td in td_list for tau in tau_list]
+    res = Parallel(n_jobs=n_jobs, verbose=0)(delayed(task)(t) for t in tasks)
+    res = [r for r in res if r is not None]
+    res.sort(key=lambda x: x[0], reverse=True)
+    return res[:30]
+
+# ---------- 5. CMA-ES 精化 ----------
+def refine_cma(best_list, mode='ANY'):
+    if not best_list: return None
+    base = best_list[0]
+    total0, (v0,th0,td0,tau0), _, _ = base
+    es = cma.CMAEvolutionStrategy([v0, th0, td0, tau0],
+                                  0.15*np.array([20, 0.3, 10, 2]),
+                                  {'bounds': [[70,0,0,0.2], [140,2*np.pi,60,10]]})
+    best = base
+    while not es.stop():
+        solutions = es.ask()
+        values = [-evaluate_cover_time_fast(v,th,td,tau,mode)[0] for v,th,td,tau in solutions]
+        es.tell(solutions, values)
+        idx = np.argmin(values)
+        if -values[idx] > best[0]:
+            best = (-values[idx], solutions[idx], [], None)
+    return best
+
+# ---------- 6. 与原脚本兼容的 evaluate_cover_time_fast ----------
+def evaluate_cover_time_fast(v_u, theta, t_drop, tau, mode='ANY'):
+    if not (v_min <= v_u <= v_max): return -1.0, [], None
+    _, E = explosion_point(v_u, theta, t_drop, tau)
+    if E[2] <= 0: return -1.0, [], None
+    t_e = t_drop + tau
+    C = cloud_center_builder(E, t_e)
+    f = build_volume_cover_fn_fast(CYL_PTS, missile_pos, C, mode)
+    intervals = find_cover_intervals_fast(f, t_e, t_e+effective_span)
+    total = sum(b-a for a,b in intervals)
+    info = dict(R=drone_pos(t_drop, v_u, theta), E=E, t_e=t_e)
+    return total, intervals, info
+
+# ---------- 7. 主程序 ----------
+if __name__ == '__main__':
+    MODE = 'ANY'
+    print('=== 多进程粗搜 + CMA 精化 ===')
+    coarse = coarse_search_parallel(mode=MODE, n_jobs=16)   # 按需改核数
+    best = refine_cma(coarse, mode=MODE)
+    total, (v_u, theta, t_d, tau), intervals, info = best
+    R, E, t_e = info['R'], info['E'], info['t_e']
+    print(f'最优遮蔽时长: {total:.6f} s')
+    print(f'v={v_u:.3f} m/s, θ={deg(theta):.2f}°, t_d={t_d:.3f} s, τ={tau:.3f} s')
